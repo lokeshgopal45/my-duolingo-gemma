@@ -61,21 +61,7 @@ function WelcomeScreen({ onEnter }) {
         </div>
       </div>
 
-      <div className="welcome-preview">
-        <div className="welcome-panel card">
-          <span className="eyebrow">Today’s learning path</span>
-          <h2>1. Warm up</h2>
-          <p>Quick recall, clean focus, and a smooth transition into the lesson flow.</p>
-        </div>
-        <div className="welcome-panel card soft-panel">
-          <span className="eyebrow">What you’ll find inside</span>
-          <ul>
-            <li>Guided lessons</li>
-            <li>Polished quiz cards</li>
-            <li>Progress and streak tracking</li>
-          </ul>
-        </div>
-      </div>
+
     </div>
   )
 }

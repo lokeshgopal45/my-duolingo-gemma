@@ -37,3 +37,15 @@ class TestSessionSerializer(serializers.ModelSerializer):
     
     def get_success_rate(self, obj):
         return obj.success_rate
+
+
+class ChoiceValidationRequestSerializer(serializers.Serializer):
+    section = serializers.CharField(max_length=80)
+    question = serializers.CharField()
+    options = serializers.ListField(
+        child=serializers.CharField(),
+        min_length=2,
+    )
+    selected_answer = serializers.CharField()
+    correct_answer = serializers.CharField()
+    explanation = serializers.CharField(required=False, allow_blank=True, allow_null=True)

@@ -10,8 +10,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
-import com.google.mediapipe.examples.llminference.ui.QuizApp
+import com.google.mediapipe.examples.llminference.ui.JapanSenseiApp
 import com.google.mediapipe.examples.llminference.ui.QuizViewModel
+import com.google.mediapipe.examples.llminference.ui.theme.BgLight
 import com.google.mediapipe.examples.llminference.ui.theme.LLMInferenceTheme
 
 class MainActivity : ComponentActivity() {
@@ -29,9 +30,9 @@ class MainActivity : ComponentActivity() {
                         modifier = Modifier
                             .fillMaxSize()
                             .padding(innerPadding),
-                        color = MaterialTheme.colorScheme.background,
+                        color = BgLight,
                     ) {
-                        QuizApp(viewModel)
+                        JapanSenseiApp(viewModel)
                     }
                 }
             }

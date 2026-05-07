@@ -1,20 +1,26 @@
 """
 Views for validation API
 """
-from rest_framework import viewsets, status
-from rest_framework.decorators import action
-from rest_framework.response import Response
-from rest_framework.request import Request
+import json
 import logging
+import re
 import time
 
-from .models import JapaneseExercise, GemmaValidationResult, TestSession
-from .serializers import (
-    JapaneseExerciseSerializer,
-    GemmaValidationResultSerializer,
-    TestSessionSerializer
-)
+from django.db import models
+from requests.exceptions import RequestException
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.request import Request
+from rest_framework.response import Response
+
 from .llm_client import LLMClient, JapaneseExerciseValidator
+from .models import GemmaValidationResult, JapaneseExercise, TestSession
+from .serializers import (
+    ChoiceValidationRequestSerializer,
+    GemmaValidationResultSerializer,
+    JapaneseExerciseSerializer,
+    TestSessionSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +65,136 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
     queryset = GemmaValidationResult.objects.all()
     serializer_class = GemmaValidationResultSerializer
     filterset_fields = ['exercise', 'model_name', 'status', 'is_correct']
+
+    def _normalize_text(self, value: str) -> str:
+        return re.sub(r"\s+", " ", str(value)).strip().lower()
+
+    def _match_option(self, candidate: str, options: list[str]) -> str | None:
+        normalized_candidate = self._normalize_text(candidate)
+        for option in options:
+            if normalized_candidate == self._normalize_text(option):
+                return option
+        for option in options:
+            if normalized_candidate in self._normalize_text(option):
+                return option
+        return None
+
+    def _extract_choice(self, response: str, options: list[str]) -> str | None:
+        normalized_response = self._normalize_text(response)
+
+        try:
+            parsed = json.loads(response)
+            if isinstance(parsed, dict):
+                for key in ('answer', 'choice', 'selected_answer', 'correct_answer'):
+                    candidate = parsed.get(key)
+                    if isinstance(candidate, str):
+                        resolved = self._match_option(candidate, options)
+                        if resolved:
+                            return resolved
+        except json.JSONDecodeError:
+            pass
+
+        for option in options:
+            if self._normalize_text(option) in normalized_response:
+                return option
+
+        label_match = re.search(r"\b([A-D])\b", response, flags=re.IGNORECASE)
+        if label_match:
+            index = ord(label_match.group(1).upper()) - ord('A')
+            if 0 <= index < len(options):
+                return options[index]
+
+        numbered_match = re.search(r"\b([1-9])\b", response)
+        if numbered_match:
+            index = int(numbered_match.group(1)) - 1
+            if 0 <= index < len(options):
+                return options[index]
+
+        return None
+
+    @action(detail=False, methods=['post'])
+    def validate_choice(self, request: Request):
+        """Validate a multiple-choice answer against Gemma."""
+
+        serializer = ChoiceValidationRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        payload = serializer.validated_data
+
+        try:
+            llm_client = LLMClient.from_settings()
+
+            if not llm_client.is_available():
+                return Response(
+                    {'error': f'LLM service ({llm_client.provider}) not available at {llm_client.base_url}'},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE
+                )
+        except (AttributeError, OSError, ValueError) as e:
+            logger.error('LLM initialization failed: %s', e)
+            return Response(
+                {'error': f'LLM service error: {str(e)}'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE
+            )
+
+        prompt_lines = [
+            f"Section: {payload['section']}",
+            f"Question: {payload['question']}",
+            "Options:",
+        ]
+
+        for index, option in enumerate(payload['options'], start=1):
+            prompt_lines.append(f"{index}. {option}")
+
+        prompt_lines.extend([
+            f"Student selected: {payload['selected_answer']}",
+            f"Reference correct answer: {payload['correct_answer']}",
+            payload.get('explanation') or '',
+            '',
+            'Return only the single best option text that answers the question.',
+            'Do not explain your reasoning.',
+        ])
+
+        prompt = "\n".join(line for line in prompt_lines if line is not None)
+
+        try:
+            start_time = time.time()
+            gemma_response, _metadata = llm_client.query(prompt, temperature=0.2)
+            response_time_ms = int((time.time() - start_time) * 1000)
+
+            gemma_choice = self._extract_choice(gemma_response, payload['options'])
+            selected_answer = payload['selected_answer']
+            correct_answer = payload['correct_answer']
+
+            is_correct = self._match_option(selected_answer, [correct_answer]) is not None
+            gemma_agrees = self._match_option(gemma_choice or '', [correct_answer]) is not None
+            confidence = 0.9 if gemma_agrees else 0.55 if gemma_choice else 0.4
+
+            notes = (
+                f"Gemma chose {gemma_choice or 'an unclear answer'}; "
+                f"reference answer is {correct_answer}."
+            )
+
+            return Response({
+                'section': payload['section'],
+                'question': payload['question'],
+                'selected_answer': selected_answer,
+                'correct_answer': correct_answer,
+                'gemma_answer': gemma_choice,
+                'gemma_response': gemma_response,
+                'is_correct': is_correct,
+                'gemma_agrees': gemma_agrees,
+                'confidence_score': confidence,
+                'validation_notes': notes,
+                'response_time_ms': response_time_ms,
+                'model_name': llm_client.model,
+                'provider': llm_client.provider,
+            }, status=status.HTTP_200_OK)
+
+        except (RequestException, OSError, ValueError) as e:
+            logger.error('Choice validation failed: %s', e)
+            return Response(
+                {'error': f'Validation failed: {str(e)}'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
     @action(detail=False, methods=['post'])
     def validate_exercise(self, request: Request):
@@ -88,8 +224,8 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
                     {'error': f'LLM service ({llm_client.provider}) not available at {llm_client.base_url}'},
                     status=status.HTTP_503_SERVICE_UNAVAILABLE
                 )
-        except Exception as e:
-            logger.error(f"LLM initialization failed: {e}")
+        except (AttributeError, OSError, ValueError) as e:
+            logger.error('LLM initialization failed: %s', e)
             return Response(
                 {'error': f'LLM service error: {str(e)}'},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE
@@ -113,7 +249,7 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
         try:
             # Query LLM
             start_time = time.time()
-            gemma_response, metadata = llm_client.query(prompt)
+            gemma_response, _metadata = llm_client.query(prompt)
             response_time_ms = int((time.time() - start_time) * 1000)
             
             # Validate response
@@ -131,8 +267,8 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
             serializer = GemmaValidationResultSerializer(result)
             return Response(serializer.data, status=status.HTTP_200_OK)
             
-        except Exception as e:
-            logger.error(f"Validation failed: {e}")
+        except (RequestException, OSError, ValueError) as e:
+            logger.error('Validation failed: %s', e)
             result.status = 'error'
             result.validation_notes = str(e)
             result.save()
@@ -159,10 +295,10 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
             llm_client = LLMClient.from_settings()
             if not llm_client.is_available():
                 return Response(
-                    {'error': f'LLM service not available'},
+                    {'error': 'LLM service not available'},
                     status=status.HTTP_503_SERVICE_UNAVAILABLE
                 )
-        except Exception as e:
+        except (AttributeError, OSError, ValueError) as e:
             return Response(
                 {'error': f'LLM service error: {str(e)}'},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE
@@ -195,7 +331,7 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
                 
                 # Query LLM
                 start_time = time.time()
-                gemma_response, metadata = llm_client.query(prompt)
+                gemma_response, _metadata = llm_client.query(prompt)
                 response_time_ms = int((time.time() - start_time) * 1000)
                 
                 # Validate
@@ -214,8 +350,8 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
                 
                 results.append(GemmaValidationResultSerializer(result).data)
                 
-            except Exception as e:
-                logger.error(f"Batch validation error for exercise {exercise_id}: {e}")
+            except (RequestException, OSError, ValueError) as e:
+                logger.error('Batch validation error for exercise %s: %s', exercise_id, e)
                 continue
         
         # Update session stats
@@ -234,7 +370,7 @@ class ValidationResultViewSet(viewsets.ModelViewSet):
         }, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['get'])
-    def statistics(self, request: Request):
+    def statistics(self, _request: Request):
         """Get validation statistics"""
         total_validations = GemmaValidationResult.objects.count()
         passed = GemmaValidationResult.objects.filter(is_correct=True).count()
